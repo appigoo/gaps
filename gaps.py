@@ -11,11 +11,14 @@ import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
-from ta.trend import ADXIndicator  # 新增: ta库用于ADX
+from ta.trend import ADXIndicator, MACD  # 扩展: MACD
+from ta.volatility import BollingerBands  # 新增: Bollinger Bands
+from ta.momentum import RSIIndicator, StochasticOscillator  # 扩展: Stochastic
+from ta.volume import OnBalanceVolumeIndicator  # 新增: OBV
 
 # Streamlit页面配置
 st.set_page_config(page_title="Gaps Indicator", page_icon="📊", layout="wide")
-st.title("📈 Gaps Indicator - 价格缺口检测与可视化（集成ML预测）")
+st.title("📈 Gaps Indicator - 价格缺口检测与可视化（集成ML预测 + 更多技术指标）")
 
 # 侧边栏参数设置
 st.sidebar.header("参数设置")
@@ -44,6 +47,12 @@ ml_threshold = st.sidebar.slider("ML预测阈值 (%)", min_value=50.0, max_value
                                  help="ML预测概率超过阈值才确认信号（仅当启用ML时）")
 adx_threshold = st.sidebar.slider("ADX趋势强度阈值", min_value=20.0, max_value=40.0, value=25.0, step=1.0,
                                   help="ADX > 阈值表示强趋势，增强延续策略信号")
+rsi_overbought = st.sidebar.slider("RSI超买阈值", min_value=60.0, max_value=80.0, value=70.0, step=1.0,
+                                   help="RSI > 此值过滤卖出信号（避免追高）")
+rsi_oversold = st.sidebar.slider("RSI超卖阈值", min_value=20.0, max_value=40.0, value=30.0, step=1.0,
+                                 help="RSI < 此值过滤买入信号（避免抄底）")
+bb_squeeze = st.sidebar.checkbox("启用Bollinger Bands挤压过滤", value=True,
+                                 help="BB上轨-下轨 < 阈值时，避免信号（市场低波动）")
 
 # 新增：ML预测参数
 st.sidebar.header("ML预测设置")
@@ -76,14 +85,47 @@ if data is not None:
                                 np.where(data['Gap_Size'] < -gap_threshold, 'Down', 'None'))
     data['Has_Gap'] = data['Gap_Type'] != 'None'
     
-    # 特征工程：为ML准备
+    # 扩展特征工程：整合更多技术指标
     data['Returns'] = data['Close'].pct_change()
     data['Volatility'] = data['Returns'].rolling(5).std()
     data['MA_5'] = data['Close'].rolling(5).mean()
     data['MA_20'] = data['Close'].rolling(20).mean()
-    data['RSI'] = compute_rsi(data['Close'], 14)  # 自定义RSI函数
-    data['Volume_MA'] = data['Volume'].rolling(20).mean()  # 新增: 平均成交量
-    data['ADX'] = ADXIndicator(data['High'], data['Low'], data['Close'], window=14).adx()  # 新增: ADX趋势强度
+    
+    # RSI
+    rsi_indicator = RSIIndicator(data['Close'], window=14)
+    data['RSI'] = rsi_indicator.rsi()
+    
+    # ADX
+    adx_indicator = ADXIndicator(data['High'], data['Low'], data['Close'], window=14)
+    data['ADX'] = adx_indicator.adx()
+    
+    # MACD
+    macd_indicator = MACD(data['Close'], window_slow=26, window_fast=12, window_sign=9)
+    data['MACD'] = macd_indicator.macd()
+    data['MACD_Signal'] = macd_indicator.macd_signal()
+    data['MACD_Hist'] = macd_indicator.macd_diff()
+    
+    # Bollinger Bands
+    bb_indicator = BollingerBands(data['Close'], window=20, window_dev=2)
+    data['BB_Upper'] = bb_indicator.bollinger_hband()
+    data['BB_Lower'] = bb_indicator.bollinger_lband()
+    data['BB_Middle'] = bb_indicator.bollinger_mavg()
+    data['BB_Width'] = (data['BB_Upper'] - data['BB_Lower']) / data['BB_Middle']  # BB宽度（挤压指标）
+    
+    # Stochastic Oscillator
+    stoch_indicator = StochasticOscillator(data['High'], data['Low'], data['Close'], window=14, smooth_window=3)
+    data['Stoch_K'] = stoch_indicator.stoch()
+    data['Stoch_D'] = stoch_indicator.stoch_signal()
+    
+    # On-Balance Volume (OBV)
+    obv_indicator = OnBalanceVolumeIndicator(data['Close'], data['Volume'])
+    data['OBV'] = obv_indicator.on_balance_volume()
+    data['OBV_Signal'] = (data['OBV'] > data['OBV'].shift(1)).astype(int)  # OBV上升信号
+    
+    # Volume MA
+    data['Volume_MA'] = data['Volume'].rolling(20).mean()
+    
+    # 目标
     data['Target'] = np.where(data['Gap_Type'].shift(-1) == 'Up', 1, 
                               np.where(data['Gap_Type'].shift(-1) == 'Down', -1, 0))  # 下一天缺口标签: 1=Up, -1=Down, 0=None
     
@@ -141,17 +183,18 @@ if data is not None:
     partial_gaps = data[data['Has_Gap'] & (data['Gap_Close_Status'] == 'Partial')]
     full_gaps = data[data['Has_Gap'] & (data['Gap_Close_Status'] == 'Full')]
 
-    # 新增：ML预测模型训练与预测
+    # 新增：ML预测模型训练与预测（扩展features）
     ml_predictions = None
     ml_model = None
     scaler = None
     if enable_ml:
-        # 准备特征（新增ADX和Volume相关）
-        features = ['Returns', 'Volatility', 'MA_5', 'MA_20', 'RSI', 'Gap_Size', 'Volume_MA', 'ADX']
+        # 准备特征（新增MACD, BB, Stoch, OBV）
+        features = ['Returns', 'Volatility', 'MA_5', 'MA_20', 'RSI', 'Gap_Size', 'Volume_MA', 'ADX', 
+                    'MACD', 'MACD_Hist', 'BB_Width', 'Stoch_K', 'OBV_Signal']
         X = data[features].dropna()
         y = data['Target'].loc[X.index]  # 对应标签
         
-        if len(X) > 20:  # 确保足够数据
+        if len(X) > 30:  # 增加最小数据要求（更多特征）
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
             
             # 标准化
@@ -169,31 +212,34 @@ if data is not None:
             train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
             train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
             
-            # 定义模型
+            # 定义模型（增加隐藏层以适应更多特征）
             class LSTMModel(nn.Module):
-                def __init__(self, input_size, hidden_size=50, num_layers=1, num_classes=3):
+                def __init__(self, input_size, hidden_size=64, num_layers=2, num_classes=3):  # 增加hidden_size和layers
                     super(LSTMModel, self).__init__()
                     self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
                     self.fc = nn.Linear(hidden_size, num_classes)
                 
                 def forward(self, x):
-                    # x shape: (batch, seq_len=1, features)
                     h0 = torch.zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size).to(x.device)
                     c0 = torch.zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size).to(x.device)
-                    out, _ = self.lstm(x.unsqueeze(1), (h0, c0))  # 扩展seq_len=1
+                    out, _ = self.lstm(x.unsqueeze(1), (h0, c0))
                     out = self.fc(out[:, -1, :])
                     return out
             
             class MLPModel(nn.Module):
-                def __init__(self, input_size, hidden_size=50, num_classes=3):
+                def __init__(self, input_size, hidden_size=64, num_classes=3):  # 增加hidden_size
                     super(MLPModel, self).__init__()
                     self.fc1 = nn.Linear(input_size, hidden_size)
-                    self.fc2 = nn.Linear(hidden_size, num_classes)
+                    self.fc2 = nn.Linear(hidden_size, hidden_size)
+                    self.fc3 = nn.Linear(hidden_size, num_classes)  # 添加一层
                     self.relu = nn.ReLU()
+                    self.dropout = nn.Dropout(0.2)
                 
                 def forward(self, x):
                     out = self.relu(self.fc1(x))
-                    out = self.fc2(out)
+                    out = self.dropout(out)
+                    out = self.relu(self.fc2(out))
+                    out = self.fc3(out)
                     return out
             
             # 选择模型
@@ -207,7 +253,7 @@ if data is not None:
             
             # 训练
             ml_model.train()
-            for epoch in range(50):  # 简单训练50 epochs
+            for epoch in range(100):  # 增加epochs以适应复杂模型
                 for batch_x, batch_y in train_loader:
                     optimizer.zero_grad()
                     outputs = ml_model(batch_x)
@@ -222,7 +268,7 @@ if data is not None:
                 _, predicted = torch.max(test_outputs, 1)
                 accuracy = (predicted == y_test_tensor).float().mean().item()
             
-            st.info(f"ML模型训练完成。测试准确率: {accuracy:.2%}")
+            st.info(f"ML模型训练完成（整合{len(features)}个指标）。测试准确率: {accuracy:.2%}")
             
             # 未来预测：使用最近数据预测未来prediction_horizon天
             recent_features = data[features].tail(prediction_horizon * 2).dropna()  # 最近数据
@@ -237,7 +283,7 @@ if data is not None:
         else:
             st.warning("数据不足，无法训练ML模型。")
 
-    # 新增：缺口交易策略回测（改进信号准确度）
+    # 新增：缺口交易策略回测（进一步整合指标过滤）
     initial_capital = 10000.0
     trades = []
     if enable_strategy:
@@ -282,13 +328,14 @@ if data is not None:
                     elif row['Gap_Type'] == 'Down':
                         base_signal = -1  # 卖出
             
-            # 改进：准确度过滤
+            # 改进：准确度过滤（新增RSI, BB, Stoch, MACD, OBV）
             signal = 0
             if base_signal != 0:
                 # 1. 成交量过滤
                 volume_confirm = row['Volume'] > row['Volume_MA'] * volume_multiplier
                 
                 # 2. ML确认（如果启用）
+                ml_prob = 0.0
                 ml_confirm = True
                 if enable_ml and ml_model and scaler:
                     current_features = scaler.transform(pd.DataFrame([row[features]]))
@@ -307,8 +354,36 @@ if data is not None:
                 if strategy_type == "缺口延续" and row['ADX'] < adx_threshold:
                     adx_confirm = False  # 弱趋势不触发延续信号
                 
-                # 组合过滤
-                if volume_confirm and ml_confirm and adx_confirm:
+                # 4. RSI过滤（超买/超卖）
+                rsi_confirm = True
+                if base_signal == 1 and row['RSI'] < rsi_oversold:  # 买入时避免极度超卖
+                    rsi_confirm = False
+                elif base_signal == -1 and row['RSI'] > rsi_overbought:  # 卖出时避免极度超买
+                    rsi_confirm = False
+                
+                # 5. Bollinger Bands挤压过滤
+                bb_confirm = True
+                if bb_squeeze and row['BB_Width'] < 0.05:  # 宽度<5%表示挤压，低波动避免信号
+                    bb_confirm = False
+                
+                # 6. Stochastic过滤（超买/超卖确认）
+                stoch_confirm = True
+                if base_signal == 1 and row['Stoch_K'] < 20:  # 买入时Stoch低位
+                    stoch_confirm = True
+                elif base_signal == -1 and row['Stoch_K'] > 80:  # 卖出时Stoch高位
+                    stoch_confirm = True
+                else:
+                    stoch_confirm = False  # 否则不确认
+                
+                # 7. MACD确认（金叉/死叉）
+                macd_confirm = (row['MACD'] > row['MACD_Signal']) == (base_signal == 1)  # 多头时MACD>信号线
+                
+                # 8. OBV确认（成交量背离）
+                obv_confirm = row['OBV_Signal'] == 1 if base_signal == 1 else True  # 买入时OBV上升
+                
+                # 组合过滤（多数确认）
+                confirms = [volume_confirm, ml_confirm, adx_confirm, rsi_confirm, bb_confirm, stoch_confirm, macd_confirm, obv_confirm]
+                if sum(confirms) >= 5:  # 至少5/8确认
                     signal = base_signal
             
             data.iloc[i, data.columns.get_loc('Strategy_Signal')] = signal
@@ -330,12 +405,12 @@ if data is not None:
                     'price': entry_price, 
                     'type': row['Gap_Type'],
                     'gap_size': abs(row['Gap_Size']),
-                    'reason': f"Volume x{volume_multiplier}, ML {ml_prob*100:.0f}%, ADX {row['ADX']:.1f}"
+                    'reason': f"Confirms: {sum(confirms)}/8 (RSI:{row['RSI']:.0f}, BB:{row['BB_Width']:.3f}, Stoch:{row['Stoch_K']:.0f}, MACD:{row['MACD_Hist']:.3f}, OBV:{row['OBV_Signal']})"
                 })
             
             elif position != 0:
-                # 检查平仓条件: 缺口关闭 或 止损（动态止损基于波动率）
-                dynamic_sl = stop_loss_pct / 100 * row['Volatility'] * np.sqrt(252) if row['Volatility'] > 0 else stop_loss_pct / 100  # 年化波动调整
+                # 检查平仓条件: 缺口关闭 或 动态止损（整合波动率 + BB宽度）
+                dynamic_sl = (stop_loss_pct / 100) * (row['Volatility'] * np.sqrt(252) + row['BB_Width'] * 10) if row['Volatility'] > 0 else stop_loss_pct / 100
                 pnl_pct = ((row['Open'] - entry_price) / entry_price) * position
                 if dynamic_sl > 0 and pnl_pct <= -dynamic_sl:
                     exit_signal = True
@@ -558,7 +633,7 @@ if data is not None:
     csv = data.to_csv()
     st.download_button("下载数据 (CSV)", csv, f"{ticker}_gaps_{period}.csv", "text/csv")
 
-# 辅助函数：RSI计算
+# 辅助函数：RSI计算（保留，但现在用ta）
 def compute_rsi(prices, window=14):
     delta = prices.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
