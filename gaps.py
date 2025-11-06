@@ -20,6 +20,15 @@ show_alerts = st.sidebar.checkbox("启用警报", value=True)
 show_partial_close = st.sidebar.checkbox("显示部分关闭", value=True)
 show_full_close = st.sidebar.checkbox("显示完全关闭", value=True)
 
+# 新增：交易策略参数
+st.sidebar.header("交易策略设置")
+enable_strategy = st.sidebar.checkbox("启用缺口交易策略", value=True)
+strategy_type = st.sidebar.selectbox("策略类型", ["简单缺口填补", "缺口延续"], index=0)
+position_size = st.sidebar.slider("仓位大小 (%)", min_value=1.0, max_value=100.0, value=100.0, step=10.0,
+                                  help="每次交易的仓位百分比（初始资金100%）")
+stop_loss_pct = st.sidebar.slider("止损 (%)", min_value=0.0, max_value=10.0, value=5.0, step=0.5,
+                                  help="基于缺口大小的止损百分比")
+
 # 获取股票数据
 @st.cache_data
 def load_data(ticker, period):
@@ -96,10 +105,100 @@ if data is not None:
     partial_gaps = data[data['Has_Gap'] & (data['Gap_Close_Status'] == 'Partial')]
     full_gaps = data[data['Has_Gap'] & (data['Gap_Close_Status'] == 'Full')]
 
-    # 可视化
-    fig = make_subplots(rows=1, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.03, subplot_titles=['价格缺口图表'],
-                        row_width=[0.2])
+    # 新增：缺口交易策略回测
+    if enable_strategy:
+        # 初始化策略列
+        data['Strategy_Signal'] = 0  # 0: 无信号, 1: 买入, -1: 卖出
+        data['Position'] = 0  # 当前仓位: 1: 多头, -1: 空头, 0: 无仓
+        data['Entry_Price'] = np.nan
+        data['Exit_Price'] = np.nan
+        data['Strategy_Return'] = 0.0
+        data['Cumulative_Return'] = 0.0
+        data['Trades'] = []  # 记录交易
+        
+        initial_capital = 10000  # 初始资金
+        capital = initial_capital
+        position = 0
+        entry_price = 0
+        
+        for i in range(1, len(data)):
+            current_date = data.index[i]
+            prev_date = data.index[i-1]
+            row = data.iloc[i]
+            
+            # 生成信号
+            signal = 0
+            if row['Has_Gap']:
+                if strategy_type == "简单缺口填补":
+                    # 填补策略: Up Gap 做空（期待填补），Down Gap 做多
+                    if row['Gap_Type'] == 'Up':
+                        signal = -1  # 卖出（空头）
+                    elif row['Gap_Type'] == 'Down':
+                        signal = 1   # 买入（多头）
+                elif strategy_type == "缺口延续":
+                    # 延续策略: Up Gap 做多，Down Gap 做空
+                    if row['Gap_Type'] == 'Up':
+                        signal = 1   # 买入
+                    elif row['Gap_Type'] == 'Down':
+                        signal = -1  # 卖出
+            
+            data.iloc[i, data.columns.get_loc('Strategy_Signal')] = signal
+            
+            # 仓位管理
+            if signal != 0 and position == 0:
+                # 开仓
+                position = signal
+                entry_price = row['Open']
+                data.iloc[i, data.columns.get_loc('Entry_Price')] = entry_price
+                data.iloc[i, data.columns.get_loc('Position')] = position
+                trades = data.iloc[i, data.columns.get_loc('Trades')]
+                trades.append({'date': current_date, 'action': 'entry', 'price': entry_price, 'type': row['Gap_Type']})
+            
+            elif position != 0:
+                # 检查平仓条件: 缺口关闭 或 止损
+                close_status = gap_status.get(prev_date, 'Open') if prev_date in gap_status else 'Open'
+                exit_signal = False
+                exit_price = row['Open']
+                
+                if close_status in ['Partial', 'Full']:
+                    exit_signal = True
+                elif stop_loss_pct > 0:
+                    pnl_pct = ((row['Open'] - entry_price) / entry_price) * position
+                    if pnl_pct <= -stop_loss_pct / 100:
+                        exit_signal = True
+                
+                if exit_signal:
+                    # 平仓
+                    exit_price = row['Open']
+                    data.iloc[i, data.columns.get_loc('Exit_Price')] = exit_price
+                    data.iloc[i, data.columns.get_loc('Position')] = 0
+                    
+                    # 计算回报
+                    trade_return = ((exit_price - entry_price) / entry_price) * position * (position_size / 100)
+                    data.iloc[i, data.columns.get_loc('Strategy_Return')] = trade_return
+                    capital *= (1 + trade_return)
+                    
+                    trades = data.iloc[i, data.columns.get_loc('Trades')]
+                    trades.append({'date': current_date, 'action': 'exit', 'price': exit_price, 'pnl': trade_return})
+                    position = 0
+                    entry_price = 0
+            
+            else:
+                data.iloc[i, data.columns.get_loc('Position')] = position
+        
+        # 累计回报
+        data['Cumulative_Return'] = (capital / initial_capital - 1) * 100
+        final_return = data['Cumulative_Return'].iloc[-1]
+        
+        # 策略绩效统计
+        trades_df = pd.DataFrame(data['Trades'].iloc[-1]) if data['Trades'].iloc[-1] else pd.DataFrame()
+        num_trades = len(trades_df) // 2 if not trades_df.empty else 0
+        win_rate = (trades_df['pnl'] > 0).sum() / len(trades_df[trades_df['action'] == 'exit']) if len(trades_df[trades_df['action'] == 'exit']) > 0 else 0
+
+    # 可视化 - 主图: 价格缺口 + 策略信号
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.1, subplot_titles=['价格缺口图表', '策略权益曲线'],
+                        row_width=[0.2, 0.7])
 
     # 添加蜡烛图
     fig.add_trace(go.Candlestick(x=data.index,
@@ -143,14 +242,83 @@ if data is not None:
     if show_full_close:
         add_gap_rectangles(full_gaps, 'rgba(0, 255, 0, 0.2)', 0.2, 'Full Close')
 
-    # 更新布局
+    # 添加策略信号标记
+    if enable_strategy:
+        buy_signals = data[data['Strategy_Signal'] == 1]
+        sell_signals = data[data['Strategy_Signal'] == -1]
+        fig.add_trace(go.Scatter(x=buy_signals.index, y=buy_signals['Low'] * 0.98,
+                                 mode='markers', marker=dict(symbol='triangle-up', size=10, color='green'),
+                                 name='买入信号'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=sell_signals.index, y=sell_signals['High'] * 1.02,
+                                 mode='markers', marker=dict(symbol='triangle-down', size=10, color='red'),
+                                 name='卖出信号'), row=1, col=1)
+
+    # 添加缺口定义注解
+    annotations = []
+    
+    # Up Gap 定义
+    annotations.append(dict(
+        xref='paper', yref='paper',
+        x=0.02, y=0.98,
+        xanchor='left', yanchor='top',
+        text='上缺口（Up Gap）: 当前 K 线的开盘价（或低点）高于前一根 K 线的收盘价（或高点），表示强势上涨（牛市信号）。',
+        showarrow=False,
+        font=dict(size=10, color='green'),
+        bgcolor='rgba(0,255,0,0.1)',
+        bordercolor='green',
+        borderwidth=1,
+        row=1, col=1
+    ))
+    
+    # Down Gap 定义
+    annotations.append(dict(
+        xref='paper', yref='paper',
+        x=0.02, y=0.92,
+        xanchor='left', yanchor='top',
+        text='下缺口（Down Gap）: 当前 K 线的开盘价（或高点）低于前一根 K 线的收盘价（或低点），表示强势下跌（熊市信号）。',
+        showarrow=False,
+        font=dict(size=10, color='red'),
+        bgcolor='rgba(255,0,0,0.1)',
+        bordercolor='red',
+        borderwidth=1,
+        row=1, col=1
+    ))
+
+    # 更新主图布局
     fig.update_layout(yaxis_title='价格 (USD)', xaxis_title='日期',
                       title=f"{ticker} 价格缺口分析 ({period})",
-                      height=600, showlegend=False,
-                      hovermode='x unified')
+                      height=800, showlegend=True,
+                      hovermode='x unified',
+                      annotations=annotations)
     fig.update_xaxes(rangeslider_visible=False)
 
     st.plotly_chart(fig, use_container_width=True)
+
+    # 策略绩效图（如果启用）
+    if enable_strategy:
+        # 权益曲线
+        equity_curve = pd.Series(index=data.index, data=np.cumsum(data['Strategy_Return']) * initial_capital + initial_capital)
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=data.index, y=equity_curve, mode='lines', name='策略权益'))
+        fig2.add_trace(go.Scatter(x=data.index, y=data['Close'] / data['Close'].iloc[0] * initial_capital, 
+                                  mode='lines', name='买入并持有'))
+        fig2.update_layout(title=f"{strategy_type} 策略权益曲线 (最终回报: {final_return:.2f}%)",
+                           yaxis_title='权益 (USD)', xaxis_title='日期', height=400)
+        st.plotly_chart(fig2, use_container_width=True)
+
+        # 策略统计
+        st.subheader("策略绩效统计")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("总交易次数", num_trades)
+        col2.metric("胜率 (%)", f"{win_rate * 100:.1f}")
+        col3.metric("总回报 (%)", f"{final_return:.2f}")
+        col4.metric("最大回撤 (%)", "N/A")  # 可进一步计算
+
+        # 交易列表
+        if not trades_df.empty:
+            st.subheader("交易记录")
+            trades_df['date'] = pd.to_datetime(trades_df['date'])
+            st.dataframe(trades_df)
 
     # 缺口统计表格
     st.subheader("缺口统计")
