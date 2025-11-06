@@ -130,7 +130,7 @@ if data is not None:
                               np.where(data['Gap_Type'].shift(-1) == 'Down', 1, 0))  # 下一天缺口标签: 2=Up, 1=Down, 0=None
     
     # 填充NaN
-    data = data.fillna(method='ffill').fillna(0)
+    data = data.ffill().fillna(0)
     
     # 检测缺口关闭 - 改进逻辑：为每个缺口独立跟踪状态
     gaps = data[data['Has_Gap']].copy()
@@ -279,7 +279,8 @@ if data is not None:
                     pred_outputs = ml_model(recent_tensor)
                     pred_probs = torch.softmax(pred_outputs, dim=1).numpy()
                     ml_predictions = pd.DataFrame(pred_probs, columns=['None', 'Down', 'Up'], index=recent_features.index)
-                    ml_predictions['Predicted_Gap'] = np.argmax(pred_probs, axis=1).map({0: 'None', 1: 'Down', 2: 'Up'})
+                    predicted_indices = np.argmax(pred_probs, axis=1)
+                    ml_predictions['Predicted_Gap'] = pd.Series(predicted_indices, index=ml_predictions.index).map({0: 'None', 1: 'Down', 2: 'Up'})
         else:
             st.warning("数据不足，无法训练ML模型。")
 
@@ -632,12 +633,3 @@ if data is not None:
     # 数据下载
     csv = data.to_csv()
     st.download_button("下载数据 (CSV)", csv, f"{ticker}_gaps_{period}.csv", "text/csv")
-
-# 辅助函数：RSI计算（保留，但现在用ta）
-def compute_rsi(prices, window=14):
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
