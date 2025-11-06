@@ -125,9 +125,9 @@ if data is not None:
     # Volume MA
     data['Volume_MA'] = data['Volume'].rolling(20).mean()
     
-    # 目标
-    data['Target'] = np.where(data['Gap_Type'].shift(-1) == 'Up', 1, 
-                              np.where(data['Gap_Type'].shift(-1) == 'Down', -1, 0))  # 下一天缺口标签: 1=Up, -1=Down, 0=None
+    # 目标（修复：映射为0=None, 1=Down, 2=Up）
+    data['Target'] = np.where(data['Gap_Type'].shift(-1) == 'Up', 2, 
+                              np.where(data['Gap_Type'].shift(-1) == 'Down', 1, 0))  # 下一天缺口标签: 2=Up, 1=Down, 0=None
     
     # 填充NaN
     data = data.fillna(method='ffill').fillna(0)
