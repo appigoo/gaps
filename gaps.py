@@ -312,8 +312,7 @@ if data is not None:
         font=dict(size=10, color='green'),
         bgcolor='rgba(0,255,0,0.1)',
         bordercolor='green',
-        borderwidth=1,
-        row=1, col=1
+        borderwidth=1
     ))
     
     # Down Gap 定义
@@ -326,8 +325,7 @@ if data is not None:
         font=dict(size=10, color='red'),
         bgcolor='rgba(255,0,0,0.1)',
         bordercolor='red',
-        borderwidth=1,
-        row=1, col=1
+        borderwidth=1
     ))
 
     # 更新布局
