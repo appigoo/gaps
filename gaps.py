@@ -5,10 +5,16 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 from datetime import datetime, timedelta
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, TensorDataset
 
 # Streamlit页面配置
 st.set_page_config(page_title="Gaps Indicator", page_icon="📊", layout="wide")
-st.title("📈 Gaps Indicator - 价格缺口检测与可视化")
+st.title("📈 Gaps Indicator - 价格缺口检测与可视化（集成ML预测）")
 
 # 侧边栏参数设置
 st.sidebar.header("参数设置")
@@ -28,6 +34,12 @@ position_size = st.sidebar.slider("仓位大小 (%)", min_value=1.0, max_value=1
                                   help="每次交易的仓位百分比（初始资金100%）")
 stop_loss_pct = st.sidebar.slider("止损 (%)", min_value=0.0, max_value=10.0, value=5.0, step=0.5,
                                   help="基于缺口大小的止损百分比")
+
+# 新增：ML预测参数
+st.sidebar.header("ML预测设置")
+enable_ml = st.sidebar.checkbox("启用ML缺口预测", value=True)
+ml_model_type = st.sidebar.selectbox("ML模型类型", ["LSTM (时间序列)", "MLP (多层感知器)"], index=0)
+prediction_horizon = st.sidebar.slider("预测天数", min_value=1, max_value=10, value=5, help="预测未来缺口概率")
 
 # 获取股票数据
 @st.cache_data
@@ -53,6 +65,18 @@ if data is not None:
     data['Gap_Type'] = np.where(data['Gap_Size'] > gap_threshold, 'Up', 
                                 np.where(data['Gap_Size'] < -gap_threshold, 'Down', 'None'))
     data['Has_Gap'] = data['Gap_Type'] != 'None'
+    
+    # 特征工程：为ML准备
+    data['Returns'] = data['Close'].pct_change()
+    data['Volatility'] = data['Returns'].rolling(5).std()
+    data['MA_5'] = data['Close'].rolling(5).mean()
+    data['MA_20'] = data['Close'].rolling(20).mean()
+    data['RSI'] = compute_rsi(data['Close'], 14)  # 自定义RSI函数
+    data['Target'] = np.where(data['Gap_Type'].shift(-1) == 'Up', 1, 
+                              np.where(data['Gap_Type'].shift(-1) == 'Down', -1, 0))  # 下一天缺口标签: 1=Up, -1=Down, 0=None
+    
+    # 填充NaN
+    data = data.fillna(method='ffill').fillna(0)
     
     # 检测缺口关闭 - 改进逻辑：为每个缺口独立跟踪状态
     gaps = data[data['Has_Gap']].copy()
@@ -104,6 +128,100 @@ if data is not None:
     active_gaps = data[data['Has_Gap'] & (data['Gap_Close_Status'] == 'Open')]
     partial_gaps = data[data['Has_Gap'] & (data['Gap_Close_Status'] == 'Partial')]
     full_gaps = data[data['Has_Gap'] & (data['Gap_Close_Status'] == 'Full')]
+
+    # 新增：ML预测模型训练与预测
+    ml_predictions = None
+    if enable_ml:
+        # 准备特征
+        features = ['Returns', 'Volatility', 'MA_5', 'MA_20', 'RSI', 'Gap_Size']
+        X = data[features].dropna()
+        y = data['Target'].loc[X.index]  # 对应标签
+        
+        if len(X) > 20:  # 确保足够数据
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            
+            # 标准化
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+            
+            # 转换为Tensor
+            X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+            y_train_tensor = torch.tensor(y_train.values, dtype=torch.long)
+            X_test_tensor = torch.tensor(X_test_scaled, dtype=torch.float32)
+            y_test_tensor = torch.tensor(y_test.values, dtype=torch.long)
+            
+            # 数据加载器
+            train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+            train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+            
+            # 定义模型
+            class LSTMModel(nn.Module):
+                def __init__(self, input_size, hidden_size=50, num_layers=1, num_classes=3):
+                    super(LSTMModel, self).__init__()
+                    self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+                    self.fc = nn.Linear(hidden_size, num_classes)
+                
+                def forward(self, x):
+                    # x shape: (batch, seq_len=1, features)
+                    h0 = torch.zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size).to(x.device)
+                    c0 = torch.zeros(self.lstm.num_layers, x.size(0), self.lstm.hidden_size).to(x.device)
+                    out, _ = self.lstm(x.unsqueeze(1), (h0, c0))  # 扩展seq_len=1
+                    out = self.fc(out[:, -1, :])
+                    return out
+            
+            class MLPModel(nn.Module):
+                def __init__(self, input_size, hidden_size=50, num_classes=3):
+                    super(MLPModel, self).__init__()
+                    self.fc1 = nn.Linear(input_size, hidden_size)
+                    self.fc2 = nn.Linear(hidden_size, num_classes)
+                    self.relu = nn.ReLU()
+                
+                def forward(self, x):
+                    out = self.relu(self.fc1(x))
+                    out = self.fc2(out)
+                    return out
+            
+            # 选择模型
+            if ml_model_type == "LSTM (时间序列)":
+                model = LSTMModel(input_size=X.shape[1])
+            else:
+                model = MLPModel(input_size=X.shape[1])
+            
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            
+            # 训练
+            model.train()
+            for epoch in range(50):  # 简单训练50 epochs
+                for batch_x, batch_y in train_loader:
+                    optimizer.zero_grad()
+                    outputs = model(batch_x)
+                    loss = criterion(outputs, batch_y)
+                    loss.backward()
+                    optimizer.step()
+            
+            # 预测
+            model.eval()
+            with torch.no_grad():
+                test_outputs = model(X_test_tensor)
+                _, predicted = torch.max(test_outputs, 1)
+                accuracy = (predicted == y_test_tensor).float().mean().item()
+            
+            st.info(f"ML模型训练完成。测试准确率: {accuracy:.2%}")
+            
+            # 未来预测：使用最近数据预测未来prediction_horizon天
+            recent_features = data[features].tail(prediction_horizon * 2).dropna()  # 最近数据
+            if len(recent_features) > 0:
+                recent_scaled = scaler.transform(recent_features)
+                recent_tensor = torch.tensor(recent_scaled, dtype=torch.float32)
+                with torch.no_grad():
+                    pred_outputs = model(recent_tensor)
+                    pred_probs = torch.softmax(pred_outputs, dim=1).numpy()
+                    ml_predictions = pd.DataFrame(pred_probs, columns=['None', 'Down', 'Up'], index=recent_features.index)
+                    ml_predictions['Predicted_Gap'] = np.argmax(pred_probs, axis=1).map({0: 'None', 1: 'Down', 2: 'Up'})
+        else:
+            st.warning("数据不足，无法训练ML模型。")
 
     # 新增：缺口交易策略回测
     initial_capital = 10000.0
@@ -341,6 +459,16 @@ if data is not None:
 
     st.plotly_chart(fig, use_container_width=True)
 
+    # 新增：ML预测可视化
+    if enable_ml and ml_predictions is not None:
+        st.subheader("ML缺口预测（未来5天概率）")
+        fig_ml = go.Figure()
+        fig_ml.add_trace(go.Bar(x=ml_predictions.index, y=ml_predictions['Up'], name='上缺口概率', marker_color='green'))
+        fig_ml.add_trace(go.Bar(x=ml_predictions.index, y=ml_predictions['Down'], name='下缺口概率', marker_color='red'))
+        fig_ml.add_trace(go.Scatter(x=ml_predictions.index, y=ml_predictions['None'], mode='lines', name='无缺口概率', line=dict(color='gray')))
+        fig_ml.update_layout(title=f"{ticker} 未来缺口预测概率", xaxis_title='日期', yaxis_title='概率', barmode='stack')
+        st.plotly_chart(fig_ml, use_container_width=True)
+
     # 策略绩效图（如果启用）
     if enable_strategy:
         # 策略统计
@@ -386,3 +514,12 @@ if data is not None:
     # 数据下载
     csv = data.to_csv()
     st.download_button("下载数据 (CSV)", csv, f"{ticker}_gaps_{period}.csv", "text/csv")
+
+# 辅助函数：RSI计算
+def compute_rsi(prices, window=14):
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
