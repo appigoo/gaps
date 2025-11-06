@@ -11,6 +11,7 @@ import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
+from ta.trend import ADXIndicator  # 新增: ta库用于ADX
 
 # Streamlit页面配置
 st.set_page_config(page_title="Gaps Indicator", page_icon="📊", layout="wide")
@@ -34,6 +35,15 @@ position_size = st.sidebar.slider("仓位大小 (%)", min_value=1.0, max_value=1
                                   help="每次交易的仓位百分比（初始资金100%）")
 stop_loss_pct = st.sidebar.slider("止损 (%)", min_value=0.0, max_value=10.0, value=5.0, step=0.5,
                                   help="基于缺口大小的止损百分比")
+
+# 改进：信号准确度参数
+st.sidebar.header("信号准确度过滤")
+volume_multiplier = st.sidebar.slider("成交量过滤倍数", min_value=1.0, max_value=3.0, value=1.5, step=0.1,
+                                      help="成交量需超过平均值的倍数才触发信号")
+ml_threshold = st.sidebar.slider("ML预测阈值 (%)", min_value=50.0, max_value=90.0, value=70.0, step=5.0,
+                                 help="ML预测概率超过阈值才确认信号（仅当启用ML时）")
+adx_threshold = st.sidebar.slider("ADX趋势强度阈值", min_value=20.0, max_value=40.0, value=25.0, step=1.0,
+                                  help="ADX > 阈值表示强趋势，增强延续策略信号")
 
 # 新增：ML预测参数
 st.sidebar.header("ML预测设置")
@@ -72,6 +82,8 @@ if data is not None:
     data['MA_5'] = data['Close'].rolling(5).mean()
     data['MA_20'] = data['Close'].rolling(20).mean()
     data['RSI'] = compute_rsi(data['Close'], 14)  # 自定义RSI函数
+    data['Volume_MA'] = data['Volume'].rolling(20).mean()  # 新增: 平均成交量
+    data['ADX'] = ADXIndicator(data['High'], data['Low'], data['Close'], window=14).adx()  # 新增: ADX趋势强度
     data['Target'] = np.where(data['Gap_Type'].shift(-1) == 'Up', 1, 
                               np.where(data['Gap_Type'].shift(-1) == 'Down', -1, 0))  # 下一天缺口标签: 1=Up, -1=Down, 0=None
     
@@ -131,9 +143,11 @@ if data is not None:
 
     # 新增：ML预测模型训练与预测
     ml_predictions = None
+    ml_model = None
+    scaler = None
     if enable_ml:
-        # 准备特征
-        features = ['Returns', 'Volatility', 'MA_5', 'MA_20', 'RSI', 'Gap_Size']
+        # 准备特征（新增ADX和Volume相关）
+        features = ['Returns', 'Volatility', 'MA_5', 'MA_20', 'RSI', 'Gap_Size', 'Volume_MA', 'ADX']
         X = data[features].dropna()
         y = data['Target'].loc[X.index]  # 对应标签
         
@@ -184,27 +198,27 @@ if data is not None:
             
             # 选择模型
             if ml_model_type == "LSTM (时间序列)":
-                model = LSTMModel(input_size=X.shape[1])
+                ml_model = LSTMModel(input_size=X.shape[1])
             else:
-                model = MLPModel(input_size=X.shape[1])
+                ml_model = MLPModel(input_size=X.shape[1])
             
             criterion = nn.CrossEntropyLoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            optimizer = optim.Adam(ml_model.parameters(), lr=0.001)
             
             # 训练
-            model.train()
+            ml_model.train()
             for epoch in range(50):  # 简单训练50 epochs
                 for batch_x, batch_y in train_loader:
                     optimizer.zero_grad()
-                    outputs = model(batch_x)
+                    outputs = ml_model(batch_x)
                     loss = criterion(outputs, batch_y)
                     loss.backward()
                     optimizer.step()
             
             # 预测
-            model.eval()
+            ml_model.eval()
             with torch.no_grad():
-                test_outputs = model(X_test_tensor)
+                test_outputs = ml_model(X_test_tensor)
                 _, predicted = torch.max(test_outputs, 1)
                 accuracy = (predicted == y_test_tensor).float().mean().item()
             
@@ -216,14 +230,14 @@ if data is not None:
                 recent_scaled = scaler.transform(recent_features)
                 recent_tensor = torch.tensor(recent_scaled, dtype=torch.float32)
                 with torch.no_grad():
-                    pred_outputs = model(recent_tensor)
+                    pred_outputs = ml_model(recent_tensor)
                     pred_probs = torch.softmax(pred_outputs, dim=1).numpy()
                     ml_predictions = pd.DataFrame(pred_probs, columns=['None', 'Down', 'Up'], index=recent_features.index)
                     ml_predictions['Predicted_Gap'] = np.argmax(pred_probs, axis=1).map({0: 'None', 1: 'Down', 2: 'Up'})
         else:
             st.warning("数据不足，无法训练ML模型。")
 
-    # 新增：缺口交易策略回测
+    # 新增：缺口交易策略回测（改进信号准确度）
     initial_capital = 10000.0
     trades = []
     if enable_strategy:
@@ -252,21 +266,50 @@ if data is not None:
             row = data.iloc[i]
             prev_date = data.index[i-1]
             
-            # 生成信号
-            signal = 0
+            # 生成信号（基础逻辑）
+            base_signal = 0
             if row['Has_Gap']:
                 if strategy_type == "简单缺口填补":
                     # 填补策略: Up Gap 做空（期待填补），Down Gap 做多
                     if row['Gap_Type'] == 'Up':
-                        signal = -1  # 卖出（空头）
+                        base_signal = -1  # 卖出（空头）
                     elif row['Gap_Type'] == 'Down':
-                        signal = 1   # 买入（多头）
+                        base_signal = 1   # 买入（多头）
                 elif strategy_type == "缺口延续":
                     # 延续策略: Up Gap 做多，Down Gap 做空
                     if row['Gap_Type'] == 'Up':
-                        signal = 1   # 买入
+                        base_signal = 1   # 买入
                     elif row['Gap_Type'] == 'Down':
-                        signal = -1  # 卖出
+                        base_signal = -1  # 卖出
+            
+            # 改进：准确度过滤
+            signal = 0
+            if base_signal != 0:
+                # 1. 成交量过滤
+                volume_confirm = row['Volume'] > row['Volume_MA'] * volume_multiplier
+                
+                # 2. ML确认（如果启用）
+                ml_confirm = True
+                if enable_ml and ml_model and scaler:
+                    current_features = scaler.transform(pd.DataFrame([row[features]]))
+                    current_tensor = torch.tensor(current_features, dtype=torch.float32)
+                    with torch.no_grad():
+                        pred_output = ml_model(current_tensor)
+                        pred_prob = torch.softmax(pred_output, dim=1).numpy()[0]
+                        if base_signal == 1:  # 买入（期待Up或Down填补）
+                            ml_prob = pred_prob[2] if row['Gap_Type'] == 'Up' else pred_prob[1]  # Up prob for continuation, Down for fill
+                        else:  # 卖出
+                            ml_prob = pred_prob[1] if row['Gap_Type'] == 'Up' else pred_prob[2]
+                        ml_confirm = ml_prob > (ml_threshold / 100)
+                
+                # 3. ADX趋势确认（针对延续策略）
+                adx_confirm = True
+                if strategy_type == "缺口延续" and row['ADX'] < adx_threshold:
+                    adx_confirm = False  # 弱趋势不触发延续信号
+                
+                # 组合过滤
+                if volume_confirm and ml_confirm and adx_confirm:
+                    signal = base_signal
             
             data.iloc[i, data.columns.get_loc('Strategy_Signal')] = signal
             
@@ -287,16 +330,16 @@ if data is not None:
                     'price': entry_price, 
                     'type': row['Gap_Type'],
                     'gap_size': abs(row['Gap_Size']),
-                    'reason': None
+                    'reason': f"Volume x{volume_multiplier}, ML {ml_prob*100:.0f}%, ADX {row['ADX']:.1f}"
                 })
             
             elif position != 0:
-                # 检查平仓条件: 缺口关闭 或 止损
-                # 先检查止损（基于开盘价）
+                # 检查平仓条件: 缺口关闭 或 止损（动态止损基于波动率）
+                dynamic_sl = stop_loss_pct / 100 * row['Volatility'] * np.sqrt(252) if row['Volatility'] > 0 else stop_loss_pct / 100  # 年化波动调整
                 pnl_pct = ((row['Open'] - entry_price) / entry_price) * position
-                if stop_loss_pct > 0 and pnl_pct <= -stop_loss_pct / 100:
+                if dynamic_sl > 0 and pnl_pct <= -dynamic_sl:
                     exit_signal = True
-                    exit_reason = 'Stop Loss'
+                    exit_reason = 'Dynamic Stop Loss'
                 
                 # 检查缺口填充（基于当日数据）
                 if not exit_signal:  # 如果未触发止损，再检查填充
