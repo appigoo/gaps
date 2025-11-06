@@ -28,6 +28,9 @@ def load_data(ticker, period):
         if data.empty:
             st.error("无法获取数据，请检查股票代码。")
             return None
+        # 修复 yfinance 最近版本返回 MultiIndex columns 的问题（针对单只股票）
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
         return data
     except Exception as e:
         st.error(f"数据加载错误: {e}")
