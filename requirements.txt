@@ -5,3 +5,4 @@ plotly
 numpy
 torch
 scikit-learn
+ta
