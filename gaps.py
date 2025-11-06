@@ -46,12 +46,12 @@ if data is not None:
     data['Has_Gap'] = data['Gap_Type'] != 'None'
     
     # 检测缺口关闭 - 改进逻辑：为每个缺口独立跟踪状态
-    gaps = data[data['Has_Gap']].copy().reset_index()
+    gaps = data[data['Has_Gap']].copy()
     gap_status = {}  # {gap_date: status}
     close_dates = {}  # {gap_date: close_date}
     
-    for _, gap_row in gaps.iterrows():
-        gap_date = gap_row['index']  # 原索引（日期）
+    for idx, gap_row in gaps.iterrows():
+        gap_date = idx
         gap_type = gap_row['Gap_Type']
         gap_end = gap_row['Prev_Close'] if gap_type == 'Up' else gap_row['Open']
         gap_start_price = gap_row['Open'] if gap_type == 'Up' else gap_row['Prev_Close']
@@ -66,40 +66,35 @@ if data is not None:
             high = future_row['High']
             close = future_row['Close']
             
-            partial_closed = False
-            full_closed = False
-            
+            # 始终检测部分和完全关闭条件（不受显示选项影响）
             if gap_type == 'Up':
-                # Up gap: 填充从上方下降
-                if show_partial_close and low <= gap_end:
-                    partial_closed = True
-                if show_full_close and close <= gap_end:
-                    full_closed = True
+                partial_cond = low <= gap_end
+                full_cond = close <= gap_end
             else:  # Down gap
-                # Down gap: 填充从下方上升
-                if show_partial_close and high >= gap_start_price:
-                    partial_closed = True
-                if show_full_close and close >= gap_start_price:
-                    full_closed = True
+                partial_cond = high >= gap_start_price
+                full_cond = close >= gap_start_price
             
-            if partial_closed or full_closed:
-                if full_closed:
-                    status = 'Full'
-                else:
-                    status = 'Partial'
+            if full_cond:
+                status = 'Full'
                 close_date = future_date
-                break  # 一旦关闭，就停止检查
+                break
+            elif partial_cond:
+                status = 'Partial'
+                close_date = future_date
+                break
         
         gap_status[gap_date] = status
         close_dates[gap_date] = close_date
     
-    # 将状态合并回数据（仅用于过滤和警报）
-    data['Gap_Close_Status'] = data.index.map(lambda x: gap_status.get(x, 'Open') if data.loc[x, 'Has_Gap'] else 'N/A')
+    # 将状态合并回数据
+    data['Gap_Close_Status'] = 'N/A'
+    for date, stat in gap_status.items():
+        data.loc[date, 'Gap_Close_Status'] = stat
     
     # 按状态分组缺口数据
-    active_gaps = gaps[gaps['index'].map(gap_status) == 'Open']
-    partial_gaps = gaps[gaps['index'].map(gap_status) == 'Partial']
-    full_gaps = gaps[gaps['index'].map(gap_status) == 'Full']
+    active_gaps = data[data['Has_Gap'] & (data['Gap_Close_Status'] == 'Open')]
+    partial_gaps = data[data['Has_Gap'] & (data['Gap_Close_Status'] == 'Partial')]
+    full_gaps = data[data['Has_Gap'] & (data['Gap_Close_Status'] == 'Full')]
 
     # 可视化
     fig = make_subplots(rows=1, cols=1, shared_xaxes=True, 
@@ -117,8 +112,8 @@ if data is not None:
 
     # 绘制缺口矩形
     def add_gap_rectangles(gap_df, color, opacity, label):
-        for _, row in gap_df.iterrows():
-            gap_date = row['index']
+        for idx, row in gap_df.iterrows():
+            gap_date = idx
             gap_type = row['Gap_Type']
             if gap_type == 'Up':
                 y0 = row['Prev_Close']
@@ -168,9 +163,9 @@ if data is not None:
     # 警报 - 基于最近缺口
     if show_alerts:
         st.subheader("警报")
-        recent_gaps = gaps.tail(5)  # 最近5个缺口
-        for _, row in recent_gaps.iterrows():
-            gap_date = row['index']
+        recent_gaps = data[data['Has_Gap']].tail(5)
+        for idx, row in recent_gaps.iterrows():
+            gap_date = idx
             status = gap_status.get(gap_date, 'Open')
             gap_dir = "向上" if row['Gap_Type'] == 'Up' else "向下"
             gap_size = abs(row['Gap_Size'])
