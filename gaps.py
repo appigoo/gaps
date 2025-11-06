@@ -106,6 +106,8 @@ if data is not None:
     full_gaps = data[data['Has_Gap'] & (data['Gap_Close_Status'] == 'Full')]
 
     # 新增：缺口交易策略回测
+    initial_capital = 10000.0
+    trades = []
     if enable_strategy:
         # 初始化策略列
         data['Strategy_Signal'] = 0  # 0: 无信号, 1: 买入, -1: 卖出
@@ -113,18 +115,24 @@ if data is not None:
         data['Entry_Price'] = np.nan
         data['Exit_Price'] = np.nan
         data['Strategy_Return'] = 0.0
-        data['Cumulative_Return'] = 0.0
-        data['Trades'] = []  # 记录交易
-        
-        initial_capital = 10000  # 初始资金
+
         capital = initial_capital
         position = 0
-        entry_price = 0
-        
-        for i in range(1, len(data)):
+        entry_price = 0.0
+        gap_type_pos = None
+        fill_target = 0.0
+        equity = [initial_capital] * len(data)
+
+        for i in range(len(data)):
+            if i == 0:
+                data.iloc[0, data.columns.get_loc('Position')] = 0
+                data.iloc[0, data.columns.get_loc('Strategy_Signal')] = 0
+                equity[0] = capital
+                continue
+
             current_date = data.index[i]
-            prev_date = data.index[i-1]
             row = data.iloc[i]
+            prev_date = data.index[i-1]
             
             # 生成信号
             signal = 0
@@ -144,32 +152,53 @@ if data is not None:
             
             data.iloc[i, data.columns.get_loc('Strategy_Signal')] = signal
             
-            # 仓位管理
+            exit_signal = False
+            exit_reason = ''
+            
             if signal != 0 and position == 0:
                 # 开仓
                 position = signal
                 entry_price = row['Open']
+                gap_type_pos = row['Gap_Type']
+                fill_target = row['Prev_Close']
                 data.iloc[i, data.columns.get_loc('Entry_Price')] = entry_price
                 data.iloc[i, data.columns.get_loc('Position')] = position
-                trades = data.iloc[i, data.columns.get_loc('Trades')]
-                trades.append({'date': current_date, 'action': 'entry', 'price': entry_price, 'type': row['Gap_Type']})
+                trades.append({
+                    'date': current_date, 
+                    'action': 'entry', 
+                    'price': entry_price, 
+                    'type': row['Gap_Type'],
+                    'gap_size': abs(row['Gap_Size']),
+                    'reason': None
+                })
             
             elif position != 0:
                 # 检查平仓条件: 缺口关闭 或 止损
-                close_status = gap_status.get(prev_date, 'Open') if prev_date in gap_status else 'Open'
-                exit_signal = False
-                exit_price = row['Open']
-                
-                if close_status in ['Partial', 'Full']:
+                # 先检查止损（基于开盘价）
+                pnl_pct = ((row['Open'] - entry_price) / entry_price) * position
+                if stop_loss_pct > 0 and pnl_pct <= -stop_loss_pct / 100:
                     exit_signal = True
-                elif stop_loss_pct > 0:
-                    pnl_pct = ((row['Open'] - entry_price) / entry_price) * position
-                    if pnl_pct <= -stop_loss_pct / 100:
+                    exit_reason = 'Stop Loss'
+                
+                # 检查缺口填充（基于当日数据）
+                if not exit_signal:  # 如果未触发止损，再检查填充
+                    if gap_type_pos == 'Up':
+                        partial_cond = row['Low'] <= fill_target
+                        full_cond = row['Close'] <= fill_target
+                    else:  # Down
+                        partial_cond = row['High'] >= fill_target
+                        full_cond = row['Close'] >= fill_target
+                    
+                    if full_cond:
                         exit_signal = True
+                        exit_reason = 'Full Close'
+                    elif partial_cond:
+                        exit_signal = True
+                        exit_reason = 'Partial Close'
                 
                 if exit_signal:
-                    # 平仓
-                    exit_price = row['Open']
+                    # 平仓（使用收盘价）
+                    exit_price = row['Close']
                     data.iloc[i, data.columns.get_loc('Exit_Price')] = exit_price
                     data.iloc[i, data.columns.get_loc('Position')] = 0
                     
@@ -178,24 +207,34 @@ if data is not None:
                     data.iloc[i, data.columns.get_loc('Strategy_Return')] = trade_return
                     capital *= (1 + trade_return)
                     
-                    trades = data.iloc[i, data.columns.get_loc('Trades')]
-                    trades.append({'date': current_date, 'action': 'exit', 'price': exit_price, 'pnl': trade_return})
+                    trades.append({
+                        'date': current_date, 
+                        'action': 'exit', 
+                        'price': exit_price, 
+                        'pnl': trade_return,
+                        'reason': exit_reason
+                    })
                     position = 0
                     entry_price = 0
+                    gap_type_pos = None
+                    fill_target = 0.0
             
             else:
+                # 无信号，保持仓位
                 data.iloc[i, data.columns.get_loc('Position')] = position
+            
+            # 更新权益
+            equity[i] = capital
         
-        # 累计回报
-        data['Cumulative_Return'] = (capital / initial_capital - 1) * 100
-        final_return = data['Cumulative_Return'].iloc[-1]
-        
-        # 策略绩效统计
-        trades_df = pd.DataFrame(data['Trades'].iloc[-1]) if data['Trades'].iloc[-1] else pd.DataFrame()
-        num_trades = len(trades_df) // 2 if not trades_df.empty else 0
-        win_rate = (trades_df['pnl'] > 0).sum() / len(trades_df[trades_df['action'] == 'exit']) if len(trades_df[trades_df['action'] == 'exit']) > 0 else 0
+        final_return = (capital / initial_capital - 1) * 100
 
-    # 可视化 - 主图: 价格缺口 + 策略信号
+        # 策略绩效统计
+        trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
+        exit_trades = trades_df[trades_df['action'] == 'exit']
+        num_trades = len(exit_trades)
+        win_rate = (exit_trades['pnl'] > 0).sum() / num_trades if num_trades > 0 else 0
+
+    # 可视化 - 主图: 价格缺口 + 策略信号 + 权益曲线
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                         vertical_spacing=0.1, subplot_titles=['价格缺口图表', '策略权益曲线'],
                         row_width=[0.2, 0.7])
@@ -253,6 +292,13 @@ if data is not None:
                                  mode='markers', marker=dict(symbol='triangle-down', size=10, color='red'),
                                  name='卖出信号'), row=1, col=1)
 
+        # 添加权益曲线到子图
+        fig.add_trace(go.Scatter(x=data.index, y=equity, mode='lines', name='策略权益',
+                                 line=dict(color='blue')), row=2, col=1)
+        bh_equity = data['Close'] / data['Close'].iloc[0] * initial_capital
+        fig.add_trace(go.Scatter(x=data.index, y=bh_equity, mode='lines', name='买入并持有',
+                                 line=dict(color='orange')), row=2, col=1)
+
     # 添加缺口定义注解
     annotations = []
     
@@ -284,8 +330,11 @@ if data is not None:
         row=1, col=1
     ))
 
-    # 更新主图布局
-    fig.update_layout(yaxis_title='价格 (USD)', xaxis_title='日期',
+    # 更新布局
+    fig.update_layout(yaxis_title='价格 (USD)', 
+                      yaxis2_title='权益 (USD)',
+                      xaxis_title='日期', 
+                      xaxis2_title='日期',
                       title=f"{ticker} 价格缺口分析 ({period})",
                       height=800, showlegend=True,
                       hovermode='x unified',
@@ -296,16 +345,6 @@ if data is not None:
 
     # 策略绩效图（如果启用）
     if enable_strategy:
-        # 权益曲线
-        equity_curve = pd.Series(index=data.index, data=np.cumsum(data['Strategy_Return']) * initial_capital + initial_capital)
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=data.index, y=equity_curve, mode='lines', name='策略权益'))
-        fig2.add_trace(go.Scatter(x=data.index, y=data['Close'] / data['Close'].iloc[0] * initial_capital, 
-                                  mode='lines', name='买入并持有'))
-        fig2.update_layout(title=f"{strategy_type} 策略权益曲线 (最终回报: {final_return:.2f}%)",
-                           yaxis_title='权益 (USD)', xaxis_title='日期', height=400)
-        st.plotly_chart(fig2, use_container_width=True)
-
         # 策略统计
         st.subheader("策略绩效统计")
         col1, col2, col3, col4 = st.columns(4)
@@ -317,7 +356,6 @@ if data is not None:
         # 交易列表
         if not trades_df.empty:
             st.subheader("交易记录")
-            trades_df['date'] = pd.to_datetime(trades_df['date'])
             st.dataframe(trades_df)
 
     # 缺口统计表格
